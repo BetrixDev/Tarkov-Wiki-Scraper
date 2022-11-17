@@ -7,15 +7,29 @@ import {
 } from "../queries/queryQuestItems";
 import { Locales } from "../typings/Locales";
 import { WikiResponse } from "../typings/WikiResponse";
+import { Parser } from "../interpreter/parser";
+import { Task } from "../queries/queryQuestItems";
+import {
+  StmtWithValue,
+  StmtWithBody,
+  StatementType,
+  SquareLinkStmt,
+} from "../interpreter/ast";
 
 interface LinkObject {
   type: "link";
   content: string;
-  url: string;
+  // Only the title of the wiki page is stored to help reduce size of the file
+  title: string;
 }
 
 interface BoldObject {
   type: "bold";
+  content: string;
+}
+
+interface StringObject {
+  type: "string";
   content: string;
 }
 
@@ -24,7 +38,30 @@ interface GrayObject {
   content: string;
 }
 
-type TokenObject = LinkObject | BoldObject | GrayObject;
+interface MediumHeaderObject {
+  type: "medHeader";
+  body: LineObject[];
+}
+
+type LineObject =
+  | LinkObject
+  | BoldObject
+  | StringObject
+  | GrayObject
+  | MediumHeaderObject;
+
+interface QuestData {
+  name: string;
+  amountNeeded: number;
+}
+
+interface QuestItemData {
+  locations: LineObject[][];
+  id: string;
+  shortName: string;
+  name: string;
+  quests: QuestData[];
+}
 
 const itemBasedObjectives: readonly TaskObjectiveType[] = [
   "buildWeapon",
@@ -48,18 +85,45 @@ export const questItems = async () => {
     });
   });
 
-  const data: Record<string, Array<string | TokenObject>> = {};
+  const data: Record<string, QuestItemData> = {};
 
-  // TODO: Use Promise.all()
   // Fetch wiki data for each item needed
   for (const item of itemsWithObjectives) {
-    if (item.shortName !== "GPU") continue; // DEBUG REMOVE
+    const locationData = await fetchWikiData(item, locales);
 
-    const wikiData = await fetchWikiData(item, locales);
-    data[item.shortName] = wikiData as any;
+    data[item.id] = {
+      id: item.id,
+      name: item.name,
+      shortName: item.shortName,
+      quests: getQuestAmountData(item, taskData),
+      locations: locationData,
+    };
   }
 
   writeFileSync(`data.json`, JSON.stringify(data, null, 4));
+};
+
+const getQuestAmountData = (item: Item, tasks: Task[]): QuestData[] => {
+  const data: QuestData[] = [];
+
+  tasks.forEach((task) => {
+    const questData: QuestData = { name: task.name, amountNeeded: 0 };
+
+    task.objectives.forEach((objective) => {
+      // Objective is item based
+      if (itemBasedObjectives.includes(objective.type)) {
+        if (objective.item?.id === item.id && objective.count) {
+          questData.amountNeeded += objective.count;
+        }
+      }
+    });
+
+    if (questData.amountNeeded > 0) {
+      data.push(questData);
+    }
+  });
+
+  return data;
 };
 
 // Fetches the raw wiki content from the Fandom API
@@ -79,152 +143,141 @@ const fetchWikiData = async (item: Item, locales: Locales) => {
   const wikiContent = Object.values(reponse.data.query.pages)[0].revisions[0]
     .slots.main["*"];
 
-  const locationData = parseWikiContent(wikiContent.split("\n"), item, locales);
+  const locationData = parseWikiContent(wikiContent, item, locales);
 
   return locationData;
 };
 
 // Parses and extracts the location data from the wiki
-const parseWikiContent = (content: string[], item: Item, locales: Locales) => {
-  let startIndex: number | undefined;
-  let endIndex: number | undefined;
+const parseWikiContent = (
+  content: string,
+  item: Item,
+  locales: Locales
+): LineObject[][] => {
+  const contentAST = Parser.createAST(content);
 
-  // Find this initial bounds for the location data
-  content.forEach((line, i) => {
-    if (line.includes("==Location==")) {
-      startIndex = i + 1;
-    } else if (
-      startIndex !== undefined &&
-      endIndex === undefined &&
-      line.startsWith("==") &&
-      !line.startsWith("===")
-    ) {
-      endIndex = i - 1;
+  writeFileSync("contentAST.json", JSON.stringify(contentAST, null, 2));
+
+  const startIndex = contentAST.body.findIndex((b) => {
+    if (b.kind === "LargeHeading") {
+      const bodyStmt = b as StmtWithBody;
+
+      return (bodyStmt.body[0] as StmtWithValue).value === "Location";
     }
   });
 
-  if (startIndex === undefined || endIndex === undefined) {
-    // Return empty array indicating no location data for the item
+  if (startIndex < 0) {
+    // Item has no location data on the wiki
     return [];
   }
 
-  const locationSlice = content.slice(startIndex, endIndex);
+  const endIndex = contentAST.body.slice(startIndex + 1).findIndex((b) => {
+    return b.kind === "LargeHeading";
+  });
 
-  const parsedContent = locationSlice.map((line) =>
-    parseWikiLine(line, item, locales)
+  if (endIndex < 0) {
+    return [];
+  }
+
+  const locationSlice = contentAST.body.slice(
+    startIndex + 2, // Add 2 to remove the heading and initial line break
+    endIndex + startIndex + 1
   );
 
-  return parsedContent;
+  const wikiLines = createLines(locationSlice);
+
+  const parsedLines = wikiLines.map((l) => parseWikiLine(l, item, locales));
+
+  return parsedLines.filter((l) => l.length > 0);
 };
 
-// Parses each individual line from the wiki content into a mini AST
-const parseWikiLine = (line: string, item: Item, locales: Locales) => {
-  // {{PAGENAME}} is a global variable which correlates to the item name in this case
-  line = line.replaceAll("{{PAGENAME}}", item.shortName);
+// Serparates tokens between line breaks into their own arrays
+const createLines = (ast: StatementType[]) => {
+  const lines: StatementType[][] = [[]];
 
-  // Remove bullet character from beginning of line
-  if (line.startsWith("* ")) {
-    line = line.slice(2);
-  } else if (line.startsWith("*")) {
-    line = line.slice(1);
+  let cursor = 0;
+
+  while (cursor < ast.length) {
+    const currentToken = ast[cursor];
+
+    if (currentToken.kind !== "LineBreak") {
+      lines[lines.length - 1].push(currentToken);
+    } else {
+      lines.push([]);
+    }
+
+    cursor++;
   }
 
-  const parsedLine: Array<string | TokenObject> = [];
+  return lines;
+};
 
-  parsedLine.push(line);
+// Resolves the AST slice of each line into a format we can parse into whatever string format we want
+const parseWikiLine = (line: StatementType[], item: Item, locales: Locales) => {
+  const parsedLine: LineObject[] = [];
 
-  const chars = line.split("");
-  let lastTokenIndex = 0;
+  let cursor = 0;
 
-  // Use traditional for loop so we can mutate i within the loop
-  for (let i = 0; i < chars.length; i++) {
-    const char = chars[i];
+  while (cursor < line.length) {
+    const currentToken = line[cursor];
 
-    if (char === "{") {
-      // Parse "{{GAME_ID}}"
+    switch (currentToken.kind) {
+      case "StringContent":
+        const st = currentToken as StmtWithValue;
+        const lastParsed = parsedLine[parsedLine.length];
 
-      if (i !== 0) {
-        // Push the last chunk of characters into the parsed array
-        const d = chars.slice(lastTokenIndex, i - 1);
-        parsedLine.push(d.join("") + " "); // Add a space since it gets cut off
-      }
+        if (lastParsed && lastParsed.type === "string") {
+          parsedLine[parsedLine.length] = {
+            type: "string",
+            content: `${lastParsed.content}${st.value}`,
+          };
+        } else {
+          parsedLine.push({ type: "string", content: st.value });
+        }
+        break;
+      case "CurlyLink":
+        const cl = currentToken as StmtWithValue;
 
-      const startIndex = chars.indexOf("{", i);
-      const endIndex = chars.indexOf("}", i);
-      const charsSlice = chars.slice(startIndex, endIndex);
+        if (cl.value === "PAGENAME") {
+          // {{PAGENAME}} resolves to the item's name
+          parsedLine.push({ type: "string", content: item.shortName });
+        } else {
+          const resolvedID = locales.templates[cl.value];
 
-      const targetID = charsSlice
-        .join("")
-        .replaceAll("{", "")
-        .replaceAll("}", "");
+          if (resolvedID) {
+            parsedLine.push({
+              type: "link",
+              content: resolvedID.ShortName.toString(),
+              title: resolvedID.Name.replace(" ", "_"),
+            });
+          }
+        }
+        break;
+      case "SquareLink":
+        const sl = currentToken as SquareLinkStmt;
 
-      const targetLocale = locales.templates[targetID];
-
-      if (targetLocale) {
         parsedLine.push({
           type: "link",
-          url: wikiLinkFromName(targetLocale.Name),
-          content: targetLocale.ShortName?.toString() ?? targetLocale.Name,
+          content: sl.display,
+          title: sl.title.replace(" ", "_"),
         });
-      } else {
+        break;
+      case "MediumHeading":
+        const ml = currentToken as StmtWithBody;
+
         parsedLine.push({
-          type: "grayed",
-          content: "UNKNOWN LINK",
+          type: "medHeader",
+          body: parseWikiLine(ml.body, item, locales).filter((t) => {
+            if (t.type !== "string") return true;
+            // Remove whitespace in headings, not the best solution, but it'll work for now
+            if (t.content === " ") return false;
+          }),
         });
-      }
-
-      // Move forward cursor since we already sifted through these characters
-      i = endIndex + 2;
-      lastTokenIndex = endIndex + 2;
-    } else if (char === "[") {
-      // Parse "[[ITEM_NAME]]"
-
-      if (i !== 0) {
-        const d = chars.slice(lastTokenIndex, i - 1);
-        parsedLine.push(d.join("") + " ");
-      }
-
-      const startIndex = i;
-      const endIndex = chars.indexOf("]", i);
-      const charsSlice = chars.slice(startIndex + 1, endIndex);
-
-      const target = charsSlice
-        .join("")
-        .replaceAll("[", "")
-        .replaceAll("]", "");
-
-      const targetPageTitle = target.split("|")[0];
-      let targetDisplayName: string;
-
-      if (targetPageTitle === target) {
-        targetDisplayName = targetPageTitle;
-      } else {
-        targetDisplayName = target.replace(`${targetPageTitle}|`, "");
-      }
-
-      parsedLine.push({
-        type: "link",
-        url: wikiLinkFromName(targetPageTitle),
-        content: targetDisplayName,
-      });
-
-      i = endIndex;
-      lastTokenIndex = endIndex + 2;
+        break;
     }
-    //  else if (char === "=") {
-    //   // Parse ===[[MAP_NAME]]===
-    //   console.log(line);
-    // }
-  }
 
-  // If no special content was found, and the line isn't empty, push the entire line into the array
-  if (parsedLine.length === 0 && line.length > 0) {
-    parsedLine.push(line);
+    cursor++;
   }
 
   return parsedLine;
-};
-
-const wikiLinkFromName = (str: string) => {
-  return `https://escapefromtarkov.fandom.com/wiki/${str.replaceAll(" ", "_")}`;
 };
